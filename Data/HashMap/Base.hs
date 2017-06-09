@@ -1,6 +1,7 @@
 {-# LANGUAGE BangPatterns, CPP, DeriveDataTypeable, MagicHash #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE PatternGuards #-}
+{-# LANGUAGE RankNTypes #-}
 #if __GLASGOW_HASKELL__ >= 708
 {-# LANGUAGE RoleAnnotations #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -10,6 +11,7 @@
 module Data.HashMap.Base
     (
       HashMap(..)
+    , HashMapM(..)
     , Leaf(..)
 
       -- * Construction
@@ -74,6 +76,7 @@ module Data.HashMap.Base
       -- Internals used by the strict version
     , Hash
     , Bitmap
+    , Shift
     , bitmapIndexedOrFull
     , collision
     , hash
@@ -91,6 +94,7 @@ module Data.HashMap.Base
     , updateOrConcatWithKey
     , filterMapAux
     , equalKeys
+    , run
     ) where
 
 #if __GLASGOW_HASKELL__ < 710
@@ -165,6 +169,32 @@ data HashMap k v
 #if __GLASGOW_HASKELL__ >= 708
 type role HashMap nominal representational
 #endif
+
+data HashMapM s k v
+    = EmptyM
+    | BitmapIndexedM !Bitmap !(A.MArray s (HashMapM s k v))
+    | LeafM !Hash !(Leaf k v)
+    | FullM !(A.MArray s (HashMapM s k v))
+    | CollisionM !Hash !(A.MArray s (Leaf k v))
+      deriving (Typeable)
+
+unsafeFreezeHashMap :: HashMapM s k v -> ST s (HashMap k v)
+unsafeFreezeHashMap EmptyM = pure Empty
+unsafeFreezeHashMap (BitmapIndexedM bm a) = do
+  af <- A.unsafeFreeze a
+  aff <- A.traverseST unsafeFreezeHashMap af
+  pure (BitmapIndexed bm aff)
+unsafeFreezeHashMap (LeafM h l) = pure (Leaf h l)
+unsafeFreezeHashMap (FullM a) = do
+  af <- A.unsafeFreeze a
+  aff <- A.traverseST unsafeFreezeHashMap af
+  pure (Full aff)
+unsafeFreezeHashMap (CollisionM h a) = do
+  af <- A.unsafeFreeze a
+  pure (Collision h af)
+
+run :: (forall s. ST s (HashMapM s k v)) -> HashMap k v
+run m = runST $ m >>= unsafeFreezeHashMap
 
 instance (NFData k, NFData v) => NFData (HashMap k v) where
     rnf Empty                 = ()
@@ -296,7 +326,7 @@ cmp cmpk cmpv t1 t2 = go (toList' t1 []) (toList' t2 [])
   where
     go (Leaf k1 l1 : tl1) (Leaf k2 l2 : tl2)
       = compare k1 k2 `mappend` leafCompare l1 l2 `mappend` go tl1 tl2
-    go (Collision k1 ary1 : tl1) (Collision k2 ary2 : tl2)
+    go (Collision k1 ary1 : _tl1) (Collision k2 ary2 : _tl2)
       = compare k1 k2 `mappend` compare (A.length ary1) (A.length ary2) `mappend`
         unorderedCompare leafCompare (A.toList ary1) (A.toList ary2)
     go (Leaf _ _ : _) (Collision _ _ : _) = LT

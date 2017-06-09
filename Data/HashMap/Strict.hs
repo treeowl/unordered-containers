@@ -103,6 +103,7 @@ import Data.HashMap.Base hiding (
     intersectionWith, intersectionWithKey, map, mapWithKey, mapMaybe,
     mapMaybeWithKey, singleton, update, unionWith, unionWithKey)
 import Data.HashMap.Unsafe (runST)
+import Control.Monad.ST (ST)
 
 -- $strictness
 --
@@ -170,41 +171,79 @@ insertWith f k0 v0 m0 = go h0 k0 v0 0 m0
         | otherwise = go h k x s $ BitmapIndexed (mask hy s) (A.singleton t)
 {-# INLINABLE insertWith #-}
 
+-- | Create a 'CollisionM' value with two 'Leaf' values.
+collisionM :: Hash -> Leaf k v -> Leaf k v -> ST s (HashMapM s k v)
+collisionM h e1 e2 =
+    do mary <- A.new 2 e1
+       A.write mary 1 e2
+       return $! CollisionM h mary
+{-# INLINE collisionM #-}
+
+-- | Create a map from two key-value pairs which hashes don't collide.
+twoM :: Shift -> Hash -> k -> v -> Hash -> k -> v -> ST s (HashMapM s k v)
+twoM = go
+  where
+    go s h1 k1 v1 h2 k2 v2
+        | bp1 == bp2 = do
+            st <- go (s+bitsPerSubkey) h1 k1 v1 h2 k2 v2
+            ary <- A.new 1 st
+            return $! BitmapIndexedM bp1 ary
+        | otherwise  = do
+            mary <- A.new 2 $ LeafM h1 (L k1 v1)
+            A.write mary idx2 $ LeafM h2 (L k2 v2)
+            return $! BitmapIndexedM (bp1 .|. bp2) mary
+      where
+        bp1  = mask h1 s
+        bp2  = mask h2 s
+        idx2 | index h1 s < index h2 s = 1
+             | otherwise               = 0
+{-# INLINE twoM #-}
+
+-- | Create a 'BitmapIndexed' or 'Full' node.
+bitmapIndexedOrFullM :: Bitmap -> A.MArray s (HashMapM s k v) -> HashMapM s k v
+bitmapIndexedOrFullM b ary
+    | b == fullNodeMask = FullM ary
+    | otherwise         = BitmapIndexedM b ary
+{-# INLINE bitmapIndexedOrFullM #-}
+
+
 -- | In-place update version of insertWith
-unsafeInsertWith :: (Eq k, Hashable k) => (v -> v -> v) -> k -> v -> HashMap k v
-                 -> HashMap k v
-unsafeInsertWith f k0 v0 m0 = runST (go h0 k0 v0 0 m0)
+insertWithM :: (Eq k, Hashable k) => (v -> v -> v) -> k -> v -> HashMapM s k v
+                 -> ST s (HashMapM s k v)
+insertWithM f k0 v0 m0 = go h0 k0 v0 0 m0
   where
     h0 = hash k0
-    go !h !k x !_ Empty = return $! leaf h k x
-    go h k x s (Leaf hy l@(L ky y))
+    go !h !k x !_ EmptyM = return $! leafM h k x
+    go h k x s (LeafM hy l@(L ky y))
         | hy == h = if ky == k
-                    then return $! leaf h k (f x y)
+                    then return $! leafM h k (f x y)
                     else do
                         let l' = x `seq` (L k x)
-                        return $! collision h l l'
-        | otherwise = two s h k x hy ky y
-    go h k x s t@(BitmapIndexed b ary)
+                        collisionM h l l'
+        | otherwise = twoM s h k x hy ky y
+    go h k x s t@(BitmapIndexedM b ary)
         | b .&. m == 0 = do
-            ary' <- A.insertM ary i $! leaf h k x
-            return $! bitmapIndexedOrFull (b .|. m) ary'
+            ary' <- A.insertMM ary i $! leafM h k x
+            pure $! bitmapIndexedOrFullM (b .|. m) ary'
         | otherwise = do
-            st <- A.indexM ary i
+            st <- A.read ary i
             st' <- go h k x (s+bitsPerSubkey) st
-            A.unsafeUpdateM ary i st'
+            A.write ary i st'
             return t
       where m = mask h s
             i = sparseIndex b m
-    go h k x s t@(Full ary) = do
-        st <- A.indexM ary i
+    go h k x s t@(FullM ary) = do
+        st <- A.read ary i
         st' <- go h k x (s+bitsPerSubkey) st
-        A.unsafeUpdateM ary i st'
+        A.write ary i st'
         return t
       where i = index h s
-    go h k x s t@(Collision hy v)
-        | h == hy   = return $! Collision h (updateOrSnocWith f k x v)
-        | otherwise = go h k x s $ BitmapIndexed (mask hy s) (A.singleton t)
-{-# INLINABLE unsafeInsertWith #-}
+    go h k x s t@(CollisionM hy v)
+        | h == hy   = CollisionM h <$> updateOrSnocWithM f k x v
+        | otherwise = do
+            ar <- A.new 1 t
+            go h k x s $ BitmapIndexedM (mask hy s) ar
+{-# INLINABLE insertWithM #-}
 
 -- | /O(log n)/ Adjust the value tied to a given key in this map only
 -- if it is present. Otherwise, leave the map alone.
@@ -455,7 +494,10 @@ fromList = L.foldl' (\ m (k, !v) -> HM.unsafeInsert k v m) empty
 -- will group all values by their keys in a list 'xs :: [(k, v)]' and
 -- return a 'HashMap k [v]'.
 fromListWith :: (Eq k, Hashable k) => (v -> v -> v) -> [(k, v)] -> HashMap k v
-fromListWith f = L.foldl' (\ m (k, v) -> unsafeInsertWith f k v m) empty
+fromListWith f = \xs -> HM.run $ Prelude.foldr go pure xs EmptyM
+  where
+    go (k, v) r m = insertWithM f k v m >>= r
+
 {-# INLINE fromListWith #-}
 
 ------------------------------------------------------------------------
@@ -481,6 +523,11 @@ updateOrSnocWith :: Eq k => (v -> v -> v) -> k -> v -> A.Array (Leaf k v)
 updateOrSnocWith f = updateOrSnocWithKey (const f)
 {-# INLINABLE updateOrSnocWith #-}
 
+updateOrSnocWithM :: Eq k => (v -> v -> v) -> k -> v -> A.MArray s (Leaf k v)
+                 -> ST s (A.MArray s (Leaf k v))
+updateOrSnocWithM f = updateOrSnocWithKeyM (const f)
+{-# INLINABLE updateOrSnocWithM #-}
+
 -- | Append the given key and value to the array. If the key is
 -- already present, instead update the value of the key by applying
 -- the given function to the new and old value (in that order). The
@@ -503,6 +550,25 @@ updateOrSnocWithKey f k0 v0 ary0 = go k0 v0 ary0 0 (A.length ary0)
                      | otherwise -> go k v ary (i+1) n
 {-# INLINABLE updateOrSnocWithKey #-}
 
+updateOrSnocWithKeyM :: Eq k => (k -> v -> v -> v) -> k -> v -> A.MArray s (Leaf k v)
+                 -> ST s (A.MArray s (Leaf k v))
+updateOrSnocWithKeyM f k0 v0 ary0 = go k0 v0 ary0 0 (A.lengthM ary0)
+  where
+    go !k v !ary !i !n
+        | i >= n = do
+            -- Not found, append to the end.
+            mary <- A.new_ (n + 1)
+            A.copyM ary 0 mary 0 n
+            let !l = v `seq` (L k v)
+            A.write mary n l
+            return mary
+        | otherwise = do
+            l <- A.read ary i
+            case l of
+              L kx y | k == kx   -> let !v' = f k v y in ary <$ A.write ary i (L k v')
+                     | otherwise -> go k v ary (i+1) n
+{-# INLINABLE updateOrSnocWithKeyM #-}
+
 ------------------------------------------------------------------------
 -- Smart constructors
 --
@@ -512,3 +578,7 @@ updateOrSnocWithKey f k0 v0 ary0 = go k0 v0 ary0 0 (A.length ary0)
 leaf :: Hash -> k -> v -> HashMap k v
 leaf h k !v = Leaf h (L k v)
 {-# INLINE leaf #-}
+
+leafM :: Hash -> k -> v -> HashMapM s k v
+leafM h k !v = LeafM h (L k v)
+{-# INLINE leafM #-}
