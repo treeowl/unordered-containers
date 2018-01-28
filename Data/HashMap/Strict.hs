@@ -266,6 +266,22 @@ alterF :: (Functor f, Eq k, Hashable k)
        => (Maybe v -> f (Maybe v)) -> k -> HashMap k v -> f (HashMap k v)
 -- Special care is taken to only calculate the hash and only perform a key
 -- comparison once.
+{-
+alterF f k m = case lookupRecordCollision h k 0 m of
+  Absent -> (<$> f Nothing) $ \fres ->
+    case fres of
+      Nothing -> m
+      Just v' -> insertNewKey h k v' 0 m
+  Present v collPos -> (<$> f (Just v)) $ \fres ->
+    case fres of
+      Nothing -> deleteKeyExists collPos h k 0 m
+      Just v' -> v' `seq`
+        if v `ptrEq` v'
+        then m
+        else insertKeyExists collPos h k v' 0 m
+  where !h = hash k
+-}
+
 alterF f k m = (<$> f mv) $ \fres ->
   case fres of
 
@@ -287,12 +303,12 @@ alterF f k m = (<$> f mv) $ \fres ->
       Absent -> insertNewKey h k v' 0 m
 
       -- Key existed before, no hash collision
-      Present v collPos ->
+      Present v collPos -> v' `seq`
         if v `ptrEq` v'
         -- If the value is identical, no-op
         then m
         -- If the value changed, update the value.
-        else v' `seq` insertKeyExists collPos h k v' 0 m
+        else insertKeyExists collPos h k v' 0 m
 
   where !h = hash k
         lookupRes = lookupRecordCollision h k 0 m

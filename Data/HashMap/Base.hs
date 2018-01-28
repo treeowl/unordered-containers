@@ -577,24 +577,20 @@ insertNewKey !h !k x !_ Empty = Leaf h (L k x)
 insertNewKey h k x s (Leaf hy l@(L ky y))
     | hy == h = collision h l (L k x)
     | otherwise = runST (two s h k x hy ky y)
-insertNewKey h k x s t@(BitmapIndexed b ary)
+insertNewKey h k x s (BitmapIndexed b ary)
     | b .&. m == 0 =
         let !ary' = A.insert ary i $! Leaf h (L k x)
         in bitmapIndexedOrFull (b .|. m) ary'
     | otherwise =
         let !st  = A.index ary i
             !st' = insertNewKey h k x (s+bitsPerSubkey) st
-        in if st' `ptrEq` st
-           then t
-           else BitmapIndexed b (A.update ary i st')
+        in BitmapIndexed b (A.update ary i st')
   where m = mask h s
         i = sparseIndex b m
-insertNewKey h k x s t@(Full ary) =
+insertNewKey h k x s (Full ary) =
     let !st  = A.index ary i
         !st' = insertNewKey h k x (s+bitsPerSubkey) st
-    in if st' `ptrEq` st
-        then t
-        else Full (update16 ary i st')
+    in Full (update16 ary i st')
   where i = index h s
 insertNewKey h k x s t@(Collision hy v)
     | h == hy   = Collision h (snocNewLeaf (L k x) v)
@@ -608,7 +604,7 @@ insertNewKey h k x s t@(Collision hy v)
       A.copy ary 0 mary 0 n
       A.write mary n leaf
       return mary
-{-# INLINABLE insertNewKey #-}
+-- {-# INLINE insertNewKey #-}
 
 
 -- Insert optimized for the case when we know the key is in the map.
@@ -621,45 +617,36 @@ insertNewKey h k x s t@(Collision hy v)
 -- We can skip the key equality check on a Leaf because we know the leaf must be
 -- for this key.
 insertKeyExists :: Int -> Hash -> k -> v -> Int -> HashMap k v -> HashMap k v
-insertKeyExists _collPos h k x s t@(Leaf hy (L ky y))
-    | hy == h = if x `ptrEq` y
-                then t
-                else Leaf h (L k x)
-    | otherwise = runST (two s h k x hy ky y)
-insertKeyExists collPos h k x s t@(BitmapIndexed b ary)
+insertKeyExists !_collPos !h !k x !_s (Leaf hy (L _ky _y))
+    = Leaf h (L k x)
+insertKeyExists collPos h k x s (BitmapIndexed b ary)
     | b .&. m == 0 =
         let !ary' = A.insert ary i $! Leaf h (L k x)
         in bitmapIndexedOrFull (b .|. m) ary'
     | otherwise =
         let !st  = A.index ary i
             !st' = insertKeyExists collPos h k x (s+bitsPerSubkey) st
-        in if st' `ptrEq` st
-           then t
-           else BitmapIndexed b (A.update ary i st')
+        in BitmapIndexed b (A.update ary i st')
   where m = mask h s
         i = sparseIndex b m
-insertKeyExists collPos h k x s t@(Full ary) =
+insertKeyExists collPos h k x s (Full ary) =
     let !st  = A.index ary i
         !st' = insertKeyExists collPos h k x (s+bitsPerSubkey) st
-    in if st' `ptrEq` st
-        then t
-        else Full (update16 ary i st')
+    in Full (update16 ary i st')
   where i = index h s
-insertKeyExists collPos h k x s t@(Collision hy v)
-    | h == hy   = if -1 == collPos
-                  then error "Internal error: insertKeyExists {collPos = -1}"
-                  else Collision h (setAtPosition collPos k x v)
-    | otherwise = insertKeyExists collPos h k x s $ BitmapIndexed (mask hy s) (A.singleton t)
-insertKeyExists _ _ _ _ !_ Empty =
+insertKeyExists collPos h k x _s (Collision hy v)
+    | collPos >= 0 = Collision h (setAtPosition collPos k x v)
+    | otherwise = error "Internal error: insertKeyExists {collPos negative}"
+insertKeyExists _ _ _ _ _ Empty =
   error "Internal error: insertKeyExists Empty"
-{-# INLINABLE insertKeyExists #-}
+-- {-# INLINE insertKeyExists #-}
 
 -- Replace the ith Leaf with Leaf k v.
 --
 -- This does not check that @i@ is within bounds of the array.
 setAtPosition :: Int -> k -> v -> A.Array (Leaf k v) -> A.Array (Leaf k v)
-setAtPosition i k x ary = A.update ary i (L k x)
-{-# INLINABLE setAtPosition #-}
+setAtPosition i k x ary = A.update ary i $! L k x
+{-# INLINE setAtPosition #-}
 
 
 -- | In-place update version of insert
@@ -859,18 +846,11 @@ delete k0 m0 = go h0 k0 0 m0
 -- We can skip:
 --  - the key equality check on the leaf, if we reach a leaf it must be the key
 deleteKeyExists :: Int -> Hash -> k -> Int -> HashMap k v -> HashMap k v
-deleteKeyExists _collPos h _ _ t@(Leaf hy (L _ _))
-  -- TODO(mrenaud): Can this comparison be removed?
-    | hy == h = Empty
-    | otherwise = t
-deleteKeyExists collPos h k s t@(BitmapIndexed b ary)
-    | b .&. m == 0 = t
-    | otherwise =
+deleteKeyExists !_collPos !_h !_k !_s (Leaf _ _) = Empty
+deleteKeyExists collPos h k s (BitmapIndexed b ary) =
         let !st = A.index ary i
             !st' = deleteKeyExists collPos h k (s+bitsPerSubkey) st
-        in if st' `ptrEq` st
-            then t
-            else case st' of
+        in case st' of
             Empty | A.length ary == 1 -> Empty
                   | A.length ary == 2 ->
                       case (i, A.index ary 0, A.index ary 1) of
@@ -884,29 +864,24 @@ deleteKeyExists collPos h k s t@(BitmapIndexed b ary)
             _ -> BitmapIndexed b (A.update ary i st')
   where m = mask h s
         i = sparseIndex b m
-deleteKeyExists collPos h k s t@(Full ary) =
+deleteKeyExists collPos h k s (Full ary) =
     let !st   = A.index ary i
         !st' = deleteKeyExists collPos h k (s+bitsPerSubkey) st
-    in if st' `ptrEq` st
-        then t
-        else case st' of
+    in case st' of
         Empty ->
             let ary' = A.delete ary i
                 bm   = fullNodeMask .&. complement (1 `unsafeShiftL` i)
             in BitmapIndexed bm ary'
         _ -> Full (A.update ary i st')
   where i = index h s
-deleteKeyExists collPos h _ _ t@(Collision hy v)
-    | h == hy = case collPos of
-        i
-            | A.length v == 2 ->
-                if i == 0
-                then Leaf h (A.index v 1)
-                else Leaf h (A.index v 0)
-            | otherwise -> Collision h (A.delete v i)
-    | otherwise = t
+deleteKeyExists collPos h _ _ (Collision hy v)
+  | A.length v == 2
+  = if collPos == 0
+    then Leaf h (A.index v 1)
+    else Leaf h (A.index v 0)
+  | otherwise = Collision h (A.delete v collPos)
 deleteKeyExists !_ !_ !_ !_ Empty = error "Internal error: deleteKeyExists empty"
-{-# INLINABLE deleteKeyExists #-}
+-- {-# INLINE deleteKeyExists #-}
 
 -- | /O(log n)/ Adjust the value tied to a given key in this map only
 -- if it is present. Otherwise, leave the map alone.
