@@ -326,56 +326,42 @@ equalKeys eq t1 t2 = go (toList' t1 []) (toList' t2 [])
 
     leafEq (L k _) (L k' _) = eq k k'
 
+-- This is just the HashMap version of H.liftHashWithSalt2.
+-- We write it separately to support hashable versions before
+-- 1.2.5 that didn't have lifted versions of Hashable.
+liftHashWithSalt2HM :: (Int -> k -> Int) -> (Int -> v -> Int) -> Int -> HashMap k v -> Int
+liftHashWithSalt2HM hk hv salt hm = go salt (toList' hm [])
+  where
+    -- go :: Int -> [HashMap k v] -> Int
+    go s [] = s
+    go s (Leaf _ l : tl)
+      = s `hashLeafWithSalt` l `go` tl
+    -- For collisions we hashmix hash value
+    -- and then array of values' hashes sorted
+    go s (Collision h a : tl)
+      = (s `H.hashWithSalt` h) `hashCollisionWithSalt` a `go` tl
+    go s (_ : tl) = s `go` tl
+
+    -- hashLeafWithSalt :: Int -> Leaf k v -> Int
+    hashLeafWithSalt s (L k v) = (s `hk` k) `hv` v
+
+    -- hashCollisionWithSalt :: Int -> A.Array (Leaf k v) -> Int
+    hashCollisionWithSalt s
+      = L.foldl' H.hashWithSalt s . arrayHashesSorted s
+
+    -- arrayHashesSorted :: Int -> A.Array (Leaf k v) -> [Int]
+    arrayHashesSorted s = L.sort . L.map (hashLeafWithSalt s) . A.toList
+
 #if MIN_VERSION_hashable(1,2,5)
 instance H.Hashable2 HashMap where
-    liftHashWithSalt2 hk hv salt hm = go salt (toList' hm [])
-      where
-        -- go :: Int -> [HashMap k v] -> Int
-        go s [] = s
-        go s (Leaf _ l : tl)
-          = s `hashLeafWithSalt` l `go` tl
-        -- For collisions we hashmix hash value
-        -- and then array of values' hashes sorted
-        go s (Collision h a : tl)
-          = (s `H.hashWithSalt` h) `hashCollisionWithSalt` a `go` tl
-        go s (_ : tl) = s `go` tl
+    liftHashWithSalt2 = liftHashWithSalt2HM
 
-        -- hashLeafWithSalt :: Int -> Leaf k v -> Int
-        hashLeafWithSalt s (L k v) = (s `hk` k) `hv` v
-
-        -- hashCollisionWithSalt :: Int -> A.Array (Leaf k v) -> Int
-        hashCollisionWithSalt s
-          = L.foldl' H.hashWithSalt s . arrayHashesSorted s
-
-        -- arrayHashesSorted :: Int -> A.Array (Leaf k v) -> [Int]
-        arrayHashesSorted s = L.sort . L.map (hashLeafWithSalt s) . A.toList
-
-instance (Hashable k) => H.Hashable1 (HashMap k) where
-    liftHashWithSalt = H.liftHashWithSalt2 H.hashWithSalt
+instance Hashable k => H.Hashable1 (HashMap k) where
+    liftHashWithSalt = liftHashWithSalt2HM H.hashWithSalt
 #endif
 
 instance (Hashable k, Hashable v) => Hashable (HashMap k v) where
-    hashWithSalt salt hm = go salt (toList' hm [])
-      where
-        go :: Int -> [HashMap k v] -> Int
-        go s [] = s
-        go s (Leaf _ l : tl)
-          = s `hashLeafWithSalt` l `go` tl
-        -- For collisions we hashmix hash value
-        -- and then array of values' hashes sorted
-        go s (Collision h a : tl)
-          = (s `H.hashWithSalt` h) `hashCollisionWithSalt` a `go` tl
-        go s (_ : tl) = s `go` tl
-
-        hashLeafWithSalt :: Int -> Leaf k v -> Int
-        hashLeafWithSalt s (L k v) = s `H.hashWithSalt` k `H.hashWithSalt` v
-
-        hashCollisionWithSalt :: Int -> A.Array (Leaf k v) -> Int
-        hashCollisionWithSalt s
-          = L.foldl' H.hashWithSalt s . arrayHashesSorted s
-
-        arrayHashesSorted :: Int -> A.Array (Leaf k v) -> [Int]
-        arrayHashesSorted s = L.sort . L.map (hashLeafWithSalt s) . A.toList
+    hashWithSalt = liftHashWithSalt2HM H.hashWithSalt H.hashWithSalt
 
   -- Helper to get 'Leaf's and 'Collision's as a list.
 toList' :: HashMap k v -> [HashMap k v] -> [HashMap k v]
